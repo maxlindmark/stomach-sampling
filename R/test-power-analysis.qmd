@@ -1,0 +1,692 @@
+---
+title: "Stomach power analysis"
+author: "Max Lindmark"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format: 
+  html:
+    page-layout: full
+    embed-resources: true
+knitr: 
+  opts_chunk:
+    fig.align: center
+    out-width: 80%
+editor: source
+execute: 
+  echo: true
+  eval: true
+  cache: false
+---
+
+## Load libraries
+
+```{r libs}
+#| message: false
+#| warning: false
+#| cache: false
+
+library(tidyverse)
+library(devtools)
+library(sdmTMB)
+library(sdmTMBextra)
+library(viridis)
+library(egg)
+library(tictoc)
+library(mapplots)
+library(wesanderson)
+library(purrr)
+library(patchwork)
+library(ggdist)
+library(viridis)
+
+# Set path
+home <- here::here()
+
+devtools::source_url("https://raw.githubusercontent.com/maxlindmark/pred-prey-overlap/main/R/functions/map-plot.R")
+
+set.seed(99)
+
+# pal <- wes_palette(5, name = "Darjeeling1") # str(pal)
+# pal <- c("black", "#FF0000", "#00A08A", "#F98400", "#5BBCD6")
+```
+
+```{r load cache}
+# To load entire cache in interactive r session, do:
+# qwraps2::lazyload_cache_dir(path = paste0(home, "/R/main-analysis/02-fit-diet-models_cache/html"))
+```
+
+## Read cleaned data
+
+```{r}
+#| message: false
+#| warning: false
+
+d <- read_csv(paste0(home, "/data/clean/stomachs.csv")) |>
+  filter(year >= 2014) |> # 10 years of data
+  mutate(
+    year_f = as.factor(year),
+    month_f = as.factor(month)
+  ) |>
+  filter(quarter %in% c(1, 4)) |>
+  mutate(across(
+    .cols = c("oxy", "temp", "depth", "salinity", "pred_length"),
+    .fns = scale,
+    .names = "{.col}_sc"
+  )) |>
+  # Instead of filtering high rpw, I assign them the max
+  mutate(rpw = ifelse(rpw > 0.5, 0.5, rpw)) |>
+  mutate(rpw_2 = rpw^(1 / 2)) |>
+  mutate(
+    prey_group = as.factor(prey_group),
+    year_ct = year - 2015
+  ) |>
+  filter(!prey_group == "Other") |> 
+  filter(prey_group == "Herring")
+```
+
+Fit a basic model which we simulate from
+
+```{r}
+mesh <- make_mesh(d, c("X", "Y"), cutoff = 15)
+
+ggplot() +
+  inlabru::gg(mesh$mesh) +
+  coord_fixed() +
+  geom_point(aes(X, Y), data = d, alpha = 0.2, size = 0.5) +
+  annotate("text", -Inf, Inf, label = paste("n knots = ", mesh$mesh$n), hjust = -0.3, vjust = 3) +
+  labs(x = "Easting (km)", y = "Northing (km)")
+
+# Fit models
+missing_years <- base::setdiff(
+  min(d$year):max(d$year),
+  unique(d$year)
+  )
+
+tic()
+m <- sdmTMB(
+  rpw_2 ~ pred_length_sc + year_ct + depth_sc,
+  data = d,
+  mesh = mesh,
+  time = "year",
+  #extra_time = missing_years,
+  spatial = "on",
+  spatiotemporal = "off", # FIXME: For speed!
+  family = tweedie()
+  )
+toc()
+
+sanity(m)
+
+m
+```
+
+Simulate new data given this model
+
+```{r}
+coefs <- tidy(m, effects = "fixed")
+ran_pars <- tidy(m, effects = "ran_pars")
+
+# Get fixed effects (B vector)
+B <- coefs$estimate
+names(B) <- coefs$term
+
+# Get random effect parameters
+range <- ran_pars$estimate[ran_pars$term == "range"]
+sigma_O <- ran_pars$estimate[ran_pars$term == "sigma_O"]
+# FIXME: turned off for speed!
+#sigma_E <- ran_pars$estimate[ran_pars$term == "sigma_E"]
+phi <- ran_pars$estimate[ran_pars$term == "phi"]
+tweedie_p <- ran_pars$estimate[ran_pars$term == "tweedie_p"]
+
+# Define year slopes to test
+# These roughly correspond to percent decline annually
+# percent_change = (exp(true_slope) - 1) * 100)
+herring_year_slopes <- seq(-0.05, -0.01, length.out = 33)
+
+pal <- viridis(length(herring_year_slopes) + 1, option = "mako", begin = 0.3, end = 0.8)[1:length(herring_year_slopes)]
+
+# Visualise these effects:
+df <- expand.grid(
+  year = min(d$year):max(d$year),
+  slope = herring_year_slopes
+) |>
+  mutate(
+    # FIXME choose another year
+    year_ct = year - 2014,
+    log_mu = -5.29 + slope * year_ct,
+    mu = exp(log_mu)
+  )
+
+ggplot(df, aes(year, mu, fill = factor(slope))) +
+  geom_line(aes(color = factor(slope)), size = 1.4) +
+  coord_cartesian(expand = 0, ylim = c(min(df$mu), 0.00505)) +
+  scale_fill_manual(values = pal) +
+  scale_color_manual(values = pal) +
+  labs(
+    x = "Year",
+    y = "Expected Value (%)",
+    fill = "Year Slope",
+    color = "Year Slope"
+  )
+
+ggplot(df, aes(year, mu*100, color = factor(slope), group = slope)) +
+  coord_cartesian(expand = 0) +
+  geom_line(size = 1.2) +
+  scale_color_manual(values = pal) +
+  theme(legend.position = "bottom") +
+  labs(
+    x = "Year",
+    color = "Slope coefficient",
+    y = "% herring of cod weight",
+    fill = "Year Slope"
+  )
+
+# Now simulate n_sim data sets for each scenario!
+n_sims <- 50
+
+# Create a data frame with all combinations 
+sim_plan <- expand.grid(
+  slope_id = 1:length(herring_year_slopes),
+  sim_num = 1:n_sims
+) |> 
+  mutate(
+    true_slope = herring_year_slopes[slope_id],
+    loop_id = row_number()
+    )
+
+# Store simulations 
+sim_dfs <- list()
+
+# Loop to generate simulated datasets
+for (i in 1:nrow(sim_plan)) {
+  
+  true_slope <- sim_plan$true_slope[i]
+  sim_num <- sim_plan$sim_num[i]
+  
+  # Modify B for this scenario
+  B_sim <- B
+  B_sim["year_ct"] <- true_slope
+  
+  # Simulate data
+  sim_dat <- sdmTMB_simulate(
+    formula = ~ pred_length_sc + year_ct + depth_sc,
+    data = d,
+    mesh = mesh,
+    family = tweedie(link = "log"),
+    time = "year",
+    B = B_sim,
+    range = range,
+    sigma_O = sigma_O,
+    # FIXME turned off for speed
+    #sigma_E = sigma_E,
+    phi = phi,
+    tweedie_p = tweedie_p,
+    seed = NULL
+  )
+  
+  # Store the simulated dataset
+  sim_dfs[[i]] <- sim_dat |> 
+    mutate(true_slope = true_slope,
+           sim_num = sim_num,
+           loop_id = i)
+    
+}
+
+sim_df <- bind_rows(sim_dfs)
+rownames(sim_df) <- NULL
+
+#hist(sim_df$observed)
+```
+
+Plot the data as simulated
+
+```{r}
+# sim_df |> 
+#   filter(sim_num == 1 & true_slope == min(true_slope)) |> 
+#   tidylog::filter(observed < 1) |> #FIXME
+#   ggplot(aes(year, observed)) + 
+#   geom_jitter(height = 0, width = 0.2) + 
+#   geom_smooth(method = "lm")
+# 
+# sim_df |> 
+#   filter(sim_num == 1 & true_slope == min(true_slope)) |> 
+#   tidylog::filter(observed < 1) |> #FIXME
+#   slice_sample(prop = 0.05, replace = FALSE) |> 
+#   ggplot(aes(year, observed)) + 
+#   geom_jitter(height = 0, width = 0.2) + 
+#   geom_smooth(method = "lm")
+```
+
+Now, for each simulated data set, fit the same model and see how well I can retrieve the true slope.
+
+```{r}
+est_list <- list()
+
+for (i in 1:nrow(sim_plan)) {
+
+  slope_val <- sim_plan$true_slope[i]
+  sim_val <- sim_plan$sim_num[i]
+  
+  dd <- sim_df |> filter(true_slope == slope_val & sim_num == sim_val)
+  
+  # Lets see if we can re-estimate the new year slope
+  m_i <- sdmTMB(
+    observed ~ pred_length_sc + year_ct + depth_sc,
+    data = dd,
+    mesh = mesh,
+    time = "year",
+    spatial = "on",
+    # FIXME: TURN OFF ST FIELDS FOR SPEED
+    spatiotemporal = "off", 
+    family = tweedie()
+    ) 
+
+  est_list[[i]] <- tidy(m_i) |> 
+    mutate(true_slope = slope_val,
+           sim_num = sim_val)
+}
+
+est_df <- bind_rows(est_list)
+```
+
+Plot how well we can retrieve the correct value
+
+```{r}
+ddw <- 0.85 # dodge width
+
+# Create position object for consistent jittering
+pos <- position_jitter(width = 0.01, height = 0, seed = 123)
+
+# Calculate summary statistics for pointrange
+summary_df <- est_df |>
+  filter(term == "year_ct") |>
+  summarise(
+    mean_est = mean(estimate),
+    ymin = quantile(estimate, 0.25),
+    ymax = quantile(estimate, 0.75),
+    .by = true_slope
+  )
+
+hline_df <- tibble(
+  true_slope = unique(est_df$true_slope),
+  hline_val = herring_year_slopes
+)
+
+# Main plot
+est_df |>
+  filter(term == "year_ct") |> 
+  ggplot(aes(factor(true_slope), estimate, 
+             fill = factor(true_slope), color = factor(true_slope))) +
+  facet_wrap(~true_slope, scales = "free") +
+  # stat_halfeye(
+  #   adjust = 0.7, 
+  #   .width = c(0.5, 0.9),
+  #   justification = -0.2,
+  #   point_interval = mean_qi,
+  #   alpha = 0.55, 
+  #   color = NA,
+  #   position = position_dodge(width = ddw)
+  # ) +
+  geom_hline(
+    data = hline_df,
+    aes(yintercept = hline_val),
+    linetype = 2, alpha = 0.6, color = "grey60"
+    ) +
+  geom_jitter(
+    position = position_jitter(width = 0.15, height = 0, seed = 123),
+    alpha = 0.35, 
+    shape = 21, 
+    color = "white",
+    size = 2
+  ) +
+  geom_pointrange(
+    data = summary_df,
+    aes(x = factor(true_slope), y = mean_est, ymin = ymin, ymax = ymax),
+    position = position_dodge(width = ddw), 
+    color = "grey20",
+    size = 0.5,
+    fatten = 2,
+    inherit.aes = FALSE
+  ) +
+  scale_fill_manual(values = pal, name = "True Slope") +
+  scale_color_manual(values = pal, name = "True Slope") +
+  labs(
+    x = "True Year Slope", 
+    y = "Estimated Year Slope"
+    ) +
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    legend.position = "bottom"
+  ) +
+  guides(
+    color = "none",
+    fill = "none"
+  )
+```
+
+Ok, that worked well. Now, add another index! How much can we keep and still estimate the year effect?
+
+```{r}
+# TODO: sample fraction or fixed numers?
+scenario <- seq(0.3, 1, by = 0.025)
+#scenario <- seq(200, 1000, by = 50)
+
+# d |> 
+#   summarise(n = n(), .by = year)
+
+# Create a data frame with all combinations 
+sim_plan_scen <- expand.grid(
+  slope_id = 1:length(herring_year_slopes),
+  sim_num = 1:n_sims,
+  scenario = scenario
+) |> 
+  mutate(
+    true_slope = herring_year_slopes[slope_id],
+    loop_id = row_number()
+    )
+
+est_scen_list <- list()
+
+for (i in 1:nrow(sim_plan_scen)) {
+
+  slope_val <- sim_plan_scen$true_slope[i]
+  sim_val <- sim_plan_scen$sim_num[i]
+  scen <- sim_plan_scen$scenario[i]
+  
+  dd <- sim_df |>
+    filter(true_slope == slope_val & sim_num == sim_val) |> 
+    group_by(year) |> 
+    # For a fixed proportion: 
+    slice_sample(prop = scen, replace = FALSE) |> 
+    #slice_sample(n = scen, replace = TRUE) |>  # we have very uneven samples sizes across years
+    ungroup()
+  
+  mesh <- make_mesh(dd, c("X", "Y"), cutoff = 15)
+  
+  # Lets see if we can re-estimate the new year slope
+  m_i <- sdmTMB(
+    observed ~ pred_length_sc + year_ct + depth_sc,
+    data = dd,
+    mesh = mesh,
+    time = "year",
+    spatial = "on",
+    # FIXME: TURN OFF ST FIELDS FOR SPEED
+    spatiotemporal = "off", 
+    family = tweedie()
+    ) 
+
+  est_scen_list[[i]] <- tidy(m_i) |> 
+    mutate(true_slope = slope_val,
+           scenario = scen,
+           sim_num = sim_val)
+  
+}
+
+est_scen_df <- bind_rows(est_scen_list)
+
+write_csv(est_scen_df, paste0(home, "/output/est_scen_df.csv"))
+```
+
+Plot how well we can retrieve the correct value
+
+```{r}
+ddw <- 0.85 # dodge width
+
+# Create position object for consistent jittering
+pos <- position_jitter(width = 0.01, height = 0, seed = 123)
+
+# Calculate summary statistics for pointrange
+summary_scen_df <- est_scen_df |>
+  filter(term == "year_ct") |>
+  summarise(
+    mean_est = mean(estimate),
+    ymin = quantile(estimate, 0.25),
+    ymax = quantile(estimate, 0.75),
+    .by = c(true_slope, scenario)
+  )
+
+summary_scen_df |> 
+  summarise(mean = mean(abs(mean_est - true_slope)), .by = scenario)
+
+est_scen_df |>
+  filter(term == "year_ct") |> 
+  filter(scenario == 1) |>
+  filter(true_slope == 0.1) |> 
+  as.data.frame()
+
+# FIXME make this plot nicer like the above with color
+
+# Main plot
+est_scen_df |>
+  filter(term == "year_ct") |> 
+  ggplot(aes(factor(scenario), estimate, 
+             fill = factor(scenario), color = factor(scenario))) +
+  facet_wrap(~true_slope, scales = "free") +
+  # geom_errorbar(
+  #   aes(ymin = conf.low, ymax = conf.high),
+  #   width = 0, alpha = 0.4,
+  #   position = position_jitter(width = 0.15, height = 0, seed = 123)
+  #   ) +
+  geom_hline(
+    data = hline_df,
+    aes(yintercept = hline_val),
+    linetype = 2, alpha = 0.6, color = "grey60"
+  ) +
+  # stat_halfeye(
+  #   adjust = 0.7, 
+  #   .width = c(0.5, 0.9),
+  #   justification = -0.2,
+  #   point_interval = mean_qi,
+  #   alpha = 0.4, 
+  #   color = NA,
+  #   position = position_dodge(width = ddw)
+  # ) +
+  geom_jitter(
+    position = position_jitter(width = 0.15, height = 0, seed = 123),
+    alpha = 0.35, 
+    shape = 21, 
+    color = "white",
+    size = 2
+  ) +
+  geom_pointrange(
+    data = summary_scen_df,
+    aes(x = factor(scenario), y = mean_est, ymin = ymin, ymax = ymax),
+    position = position_dodge(width = ddw), 
+    color = "grey20",
+    size = 0.5,
+    fatten = 2
+    ) +
+  # scale_fill_manual(values = pal, name = "True Slope") +
+  # scale_color_manual(values = pal, name = "True Slope") +
+  guides(
+    color = "none",
+    fill = "none" 
+  ) + 
+  labs(#x = "Scenario (proportion stomachs retained by year)",
+       x = "Sampled stomachs retained by year",
+       y = "Estimated year slope")
+```
+
+```{r}
+# FIXME I need a boxplot or pointrange here... or a violoing
+
+sum_scen <- est_scen_df |>
+  filter(term == "year_ct") |> 
+  mutate(mean_abs_dev = abs(estimate - true_slope))
+
+sum_scen_sum <- sum_scen |> 
+  summarise(median = median(mean_abs_dev),
+            upr = quantile(mean_abs_dev, 0.1),
+            lwr = quantile(mean_abs_dev, 0.9),
+            .by = "scenario")
+
+ddw <- 0.3  # dodge width
+
+ggplot(sum_scen, aes(factor(scenario), mean_abs_dev, 
+                     fill = factor(scenario), color = factor(scenario))) +
+  geom_jitter(
+    position = position_jitter(width = 0.15, height = 0, seed = 123),
+    alpha = 0.25, 
+    shape = 21, 
+    color = "white",
+    size = 2
+  ) +
+  geom_pointrange(
+    data = sum_scen_sum,
+    aes(x = factor(scenario), y = median, ymin = lwr, ymax = upr),
+    position = position_dodge(width = ddw),
+    color = "grey20", size = 0.5
+  ) +
+  # scale_fill_manual(values = pal, name = "Scenario") +
+  # scale_color_manual(values = pal, name = "Scenario") +
+  guides(color = "none", fill = "none") +
+  labs(
+    x = "Sampled stomachs retained by year",
+    y = "Mean absolute difference in estimate"
+  )
+
+# sum_scen |>
+#   ggplot(aes(factor(scenario), mean_abs_dev, 
+#              fill = factor(scenario), color = factor(scenario))) +
+#   facet_wrap(~true_slope, scales = "free") +
+#   stat_halfeye(
+#     adjust = 0.7,
+#     .width = c(0.5, 0.9),
+#     justification = -0.2,
+#     point_interval = mean_qi,
+#     alpha = 0.4,
+#     color = NA,
+#     position = position_dodge(width = ddw)
+#   ) +
+#   geom_jitter(
+#     position = position_jitter(width = 0.15, height = 0, seed = 123),
+#     alpha = 0.35, 
+#     shape = 21, 
+#     color = "white",
+#     size = 2
+#   ) +
+#   scale_fill_manual(values = pal, name = "True Slope") +
+#   scale_color_manual(values = pal, name = "True Slope") +
+#   guides(
+#     color = "none",
+#     fill = "none" 
+#   ) + 
+#   labs(x = "Scenario (proportion stomachs retained by year)",
+#        y = "Estimated year slope")
+```
+
+```{r}
+# What is the proportion of not estimating negative slope?
+sum_scen_heat <- est_scen_df |>
+  filter(term == "year_ct") |> 
+  mutate(correct_sign = estimate < 0) |> 
+  summarise(
+    prop_negative = mean(correct_sign),
+    .by = c(scenario, true_slope)
+  ) |> 
+  mutate(percent_change = (exp(true_slope) - 1) * 100)
+  
+ggplot(sum_scen_heat, aes(scenario, true_slope, fill = prop_negative)) + 
+  geom_raster() +
+  geom_contour(
+    aes(scenario, true_slope, z = prop_negative),
+    inherit.aes = FALSE,
+    breaks = 0.9,          # 90% isocline
+    color = "black",
+    linewidth = 1
+  ) +
+  # scale_fill_viridis_c(
+  #   option = "rocket",
+  #   limits = c(0, 1),
+  #   breaks = seq(0, 1, 0.2),
+  #   labels = scales::percent
+  # ) +
+  scale_fill_gradient2(midpoint = 0.9) +
+  # geom_text(aes(label = scales::percent(prop_negative, accuracy = 1)),
+  #           color = "black", size = 6) +
+  labs(
+    x = "Scenario (Sample Size Multiplier)",
+    y = "True Year Slope",
+    fill = "Proportion\nNegative"
+  ) +
+  coord_cartesian(expand = 0)
+```
+
+```{r}
+# # Plot sample size in relation to scenarios!
+# ssize <- d |> 
+#   summarise(n = n(), .by = year) |>
+#   arrange(year)
+# 
+# ssize_scen <- ssize |>
+#   crossing(scenario = scenario) |>
+#   mutate(n_sampled = round(n * scenario))
+# 
+# ggplot(ssize_scen, aes(x = factor(year), y = n_sampled, fill = factor(scenario))) +
+#   coord_cartesian(expand = 0) +
+#   geom_col(position = "dodge") +
+#   # scale_fill_manual(values = pal, name = "True Slope") +
+#   # scale_color_manual(values = pal, name = "True Slope") +
+#   labs(
+#     x = "Year",
+#     y = "Sample Size (after subsampling)",
+#     fill = "Scenario (Fraction)"
+#   )
+```
+
+
+TODO:
+
+Maybe look at intercept also? How well do we estimate the mean...
+
+Do the same plot i have for est_scen but color by correct sign!
+
+Slice sample also fixed value by year!! Maybe even generate more even data by simulating new X and Y at mean sample size and replicate with noise by year?
+
+
+
+```{r}
+# SAMPLING SCENARIOS:
+# 
+# Recall the set of sampling designs:
+# 
+# 1. Keep 1 random haul per ICES rectangle, 1 fish from each cm class
+# 
+# 2. Keep 1 random haul per ICES rectangle and strata, 1 fish from each cm class / Mich: 2 depth strata enough
+# 
+# 3. All hauls, 2 fish from each 5-cm class
+# 
+# 4. Same as now (all hauls, 1 per cm class + ensure range of depths are kept), but sample every other year
+
+#| message: false
+
+s1 <- d |>
+  group_by(year, quarter, ices_rect) |>
+  filter(haul_id %in% sample(unique(haul_id), 1)) |>
+  group_by(year, quarter, haul_id, ices_rect, pred_length) |>
+  filter(pred_id %in% sample(unique(pred_id), 1)) |>
+  ungroup()
+  
+s2 <- d |>
+  #mutate(depth_strata = ifelse(depth < 40, "shallow", "deep")) |>
+  mutate(depth2 = ifelse(depth >= 100, 100, depth)) |> 
+  mutate(depth_strata = cut(depth2,
+                            breaks = c(0, 20, 40, 60, 80, 100),
+                            labels = c("0-20", "21-40", "41-60", "61-80", "81-100"),
+                            include.lowest = TRUE)) |> 
+  group_by(year, quarter, ices_rect, depth_strata) |>
+  filter(haul_id %in% sample(unique(haul_id), 1)) |>
+  group_by(year, quarter, haul_id, ices_rect, pred_length) |>
+  filter(pred_id %in% sample(unique(pred_id), 1)) |>
+  ungroup()
+
+s3 <- d |>
+  mutate(length_group = cut(pred_length, breaks = seq(0, 115, by = 5))) |>
+  group_by(year, quarter, haul_id, length_group) |>
+  filter(pred_id %in% sample(unique(pred_id), 2, replace = TRUE)) |>
+  ungroup()
+
+s4 <- d |>
+  filter(year %in% seq(min(d$year), max(d$year), by = 2))
+```
+

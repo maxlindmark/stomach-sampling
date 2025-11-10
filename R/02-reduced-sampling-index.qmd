@@ -1,0 +1,918 @@
+---
+title: "Explore effect of reduced stomach sampling"
+author: "Max Lindmark"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format: 
+  html:
+    page-layout: full
+    embed-resources: true
+knitr: 
+  opts_chunk:
+    fig.align: center
+    out-width: 80%
+editor: source
+execute: 
+  echo: true
+  eval: true
+  cache: false
+---
+
+## Load libraries
+
+```{r libs}
+#| message: false
+#| warning: false
+#| cache: false
+
+library(tidyverse)
+library(devtools)
+library(sdmTMB)
+library(sdmTMBextra)
+library(tidylog)
+library(viridis)
+library(egg)
+library(tictoc)
+library(mapplots)
+library(purrr)
+library(patchwork)
+
+# Set path
+home <- here::here()
+
+devtools::source_url("https://raw.githubusercontent.com/maxlindmark/pred-prey-overlap/main/R/functions/map-plot.R")
+
+set.seed(99)
+```
+
+```{r load cache}
+# To load entire cache in interactive r session, do:
+# qwraps2::lazyload_cache_dir(path = paste0(home, "/R/main-analysis/02-fit-diet-models_cache/html"))
+```
+
+## Read cleaned data
+
+```{r}
+#| message: false
+#| warning: false
+
+d <- read_csv(paste0(home, "/data/clean/stomachs.csv")) |>
+  pivot_wider(names_from = "prey_group", values_from = "rpw") |> 
+  mutate(Other = Other + `Other invertebrates` + `Other pisces` + Saduria) |> 
+  dplyr::select(-`Other invertebrates`, -`Other pisces`, -Saduria) |> 
+  pivot_longer(c("Other", "Sprat", "Herring"),
+               names_to = "prey_group", values_to = "rpw") |> 
+  mutate(
+    year_f = as.factor(year),
+    month_f = as.factor(month)
+  ) |>
+  filter(quarter %in% c(1, 4)) |>
+  mutate(across(
+    .cols = c("oxy", "temp", "depth", "salinity", "pred_length"),
+    .fns = scale,
+    .names = "{.col}_sc"
+  )) |>
+  # Instead of filtering high rpw, I assign them the max
+  mutate(rpw = ifelse(rpw > 0.5, 0.5, rpw)) |>
+  mutate(
+    prey_group = as.factor(prey_group),
+    year_ct = year - 2000
+  )
+
+pred_grid <-
+  bind_rows(
+    read_csv(paste0(home, "/data/clean/pred_grid_(1_2).csv")),
+    read_csv(paste0(home, "/data/clean/pred_grid_(2_2).csv"))
+  ) |>
+  filter(year >= 1995 & year <= 2023) |>
+  filter(quarter == 4) |> # Not needed in theory for saduria...
+  mutate(
+    year_ct = year - 2000,
+    year_f = as.factor(year),
+    oxy_sc = (oxy - mean(d$oxy)) / sd(d$oxy),
+    temp_sc = (temp - mean(d$temp)) / sd(d$temp),
+    depth_sc = (depth - mean(d$depth)) / sd(d$depth),
+    salinity_sc = (salinity - mean(d$salinity)) / sd(d$salinity),
+    pred_length_sc = 0
+  )
+```
+
+## Plot sample size by data source
+
+```{r}
+d |>
+  summarise(
+    n = length(unique(pred_id)),
+    .by = c(year, data_source, Country)
+  ) |>
+  mutate(data_source = forcats::fct_recode(data_source,
+    "Current database" = "new_db",
+    "Swedish data" = "new_SE",
+    "Old database" = "old_db"
+  )) |>
+  ggplot(aes(year, n, fill = Country)) +
+  geom_col() +
+  facet_wrap(~data_source, ncol = 1) +
+  coord_cartesian(expand = 0) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    y = "Number of predators",
+    x = "Year"
+  )
+
+ggsave(paste0(home, "/figures/sample_by_db.png"), width = 17, height = 17, units = "cm")
+```
+
+## Plot sample size in space
+
+```{r}
+# Sample size in space
+d_haul <- d |>
+  summarise(n = length(unique(pred_id)), .by = c(X, Y, year, haul_id))
+
+p1 <- plot_map +
+  geom_point(
+    data = d_haul, aes(X * 1000, Y * 1000, color = year, size = n),
+    alpha = 0.5
+  ) +
+  scale_size(range = c(0.1, 4)) +
+  theme(legend.position = "bottom") +
+  labs(color = "Year") +
+  scale_color_viridis(option = "A") +
+  theme(
+    legend.key.width = unit(0.9, "cm"),
+    legend.box = "vertical"
+  ) +
+  geom_sf(color = "gray80") 
+
+d_country <- d |>
+  summarise(n = length(unique(pred_id)), .by = c(X, Y, year, haul_id, Country))
+
+p2 <- plot_map +
+  geom_point(
+    data = d_country, aes(X * 1000, Y * 1000, color = Country),
+    alpha = 0.5, size = 0.7
+  ) +
+  guides(colour = guide_legend(
+    title.position = "top", title.hjust = 0.5,
+    override.aes = list(size = 2, alpha = 1)
+  )) +
+  scale_color_brewer(palette = "Set2") +
+  geom_sf(color = "gray80") 
+
+(p1 + p2) & theme(legend.position = "bottom")
+
+ggsave(paste0(home, "/figures/sample_in_space.png"), width = 21, height = 14, units = "cm")
+```
+
+## Sub-sample data, store in list and fit models to a loop
+
+Following Anderson et al 2024 (testing the effect of MPA for index trend estimates), we’d use all data (from a given time-period), fit a model to that and calculate an area-expanded index. Since the true mean is unknown, we’d treat this as our best estimate of the mean for each year. Next we would refit the same model (or as complex a model is allowed) to a subset of the data following a set of sampling designs:
+
+1. Keep 1 random haul per ICES rectangle, 1 fish from each cm class
+
+2. Keep 1 random haul per ICES rectangle and strata, 1 fish from each cm class / Mich: 2 depth strata enough
+
+3. All hauls, 2 fish from each 5 cm class
+
+4. Same as now (all hauls, 1 per cm class + ensure range of depths are kept), but sample every other year
+
+5. 10 stomachs per 5 cm length class per subdivision 
+
+6. 2 stomachs per 5 cm per rectangle
+
+```{r}
+#| message: false
+
+# I don't only want to sample, I want to repeat this processes many times
+
+iter <- c(1:30)
+
+dlist <- list()
+
+for(i in iter){
+
+  s1 <- d |>
+    group_by(year, quarter, ices_rect) |>
+    filter(haul_id %in% sample(unique(haul_id), 1)) |>
+    group_by(year, quarter, haul_id, ices_rect, pred_length) |>
+    filter(pred_id %in% sample(unique(pred_id), 1)) |>
+    ungroup()
+  
+  s2 <- d |>
+    #mutate(depth_strata = ifelse(depth < 40, "shallow", "deep")) |>
+    mutate(depth2 = ifelse(depth >= 100, 100, depth)) |> 
+    mutate(depth_strata = cut(depth2,
+                              breaks = c(0, 20, 40, 60, 80, 100),
+                              labels = c("0-20", "21-40", "41-60", "61-80", "81-100"),
+                              include.lowest = TRUE)) |> 
+    group_by(year, quarter, ices_rect, depth_strata) |>
+    filter(haul_id %in% sample(unique(haul_id), 1)) |>
+    group_by(year, quarter, haul_id, ices_rect, pred_length) |>
+    filter(pred_id %in% sample(unique(pred_id), 1)) |>
+    ungroup()
+  
+  s3 <- d |>
+    mutate(length_group = cut(pred_length, breaks = seq(0, 115, by = 5))) |>
+    group_by(year, quarter, haul_id, length_group) |>
+    filter(pred_id %in% sample(
+      unique(pred_id),
+      size = min(2, length(unique(pred_id))),
+      replace = FALSE
+      )) |> 
+    ungroup()
+  
+  s4 <- d |>
+    filter(year %in% seq(min(d$year), max(d$year), by = 2))  
+  
+  s5 <- d |>
+    mutate(length_group = cut(pred_length, breaks = seq(0, 115, by = 5))) |>
+    # Sample max 2 per haul_id (per 5 cm bin)
+    group_by(year, quarter, haul_id, length_group) |>
+    mutate(n_pred = n_distinct(pred_id)) |>
+    filter(pred_id %in% sample(unique(pred_id), 
+                               size = min(2, n_pred),
+                               replace = FALSE)) |>
+    ungroup() |>
+    # Sample up to 10 per length_group per sub_division & country
+    group_by(year, quarter, sub_div, length_group, Country) |> 
+    mutate(n_pred = n_distinct(pred_id)) |>
+    filter(pred_id %in% sample(unique(pred_id), 
+                               size = min(10, n_pred),  # up to 10 per bin per sub_div
+                               replace = FALSE)) |>
+    ungroup()
+  
+  s6 <- d |>
+  mutate(length_group = cut(pred_length, breaks = seq(0, 115, by = 5))) |>
+  # Sample max 2 per haul_id (per 5 cm bin)
+  group_by(year, quarter, haul_id, length_group) |>
+  mutate(n_pred = n_distinct(pred_id)) |>
+  filter(pred_id %in% sample(
+    unique(pred_id),
+    size = min(2, n_pred),
+    replace = FALSE
+  )) |>
+  ungroup() |>
+  # Sample up to 2 per rectangle (per 5 cm bin)
+  group_by(year, quarter, ices_rect, length_group, Country) |>
+  mutate(n_pred = n_distinct(pred_id)) |>
+  filter(pred_id %in% sample(
+    unique(pred_id),
+    size = min(2, n_pred),
+    replace = FALSE
+  )) |>
+  ungroup()
+  
+  d_all <- bind_rows(
+    d  |> mutate(scenario = "all", iter = i),
+    s1 |> mutate(scenario = "s1",  iter = i),
+    s2 |> mutate(scenario = "s2",  iter = i),
+    s3 |> mutate(scenario = "s3",  iter = i),
+    s4 |> mutate(scenario = "s4",  iter = i),
+    s5 |> mutate(scenario = "s5",  iter = i),
+    s6 |> mutate(scenario = "s6",  iter = i)
+    )
+    
+    dlist[[i]] <- d_all
+
+}
+
+df <- bind_rows(dlist)
+
+d |> 
+  summarise(n = length(unique(haul_id)),
+            .by = c(year, quarter, subdiv)) |> 
+  summarise(mean = mean(n))
+```
+
+```{r}
+#| message: false
+
+n_pred_ids <- function(data, scenario_name) {
+  data |>
+    filter(scenario == scenario_name) |> 
+    summarise(n = length(unique(pred_id)), .by = c(year, iter)) |>
+    mutate(Scenario = scenario_name)
+}
+
+dn  <- n_pred_ids(df, "all")
+s1n <- n_pred_ids(df, "s1")
+s2n <- n_pred_ids(df, "s2")
+s3n <- n_pred_ids(df, "s3")
+s4n <- n_pred_ids(df, "s4")
+s5n <- n_pred_ids(df, "s5")
+s6n <- n_pred_ids(df, "s6")
+
+dsum <- bind_rows(s1n, s2n, s3n, s4n
+                  #, s5n, s6n
+                  ) |> 
+  # Calculate mean + se across iterations, by scenario
+  summarise(mean = mean(n), 
+            sd = sd(n), 
+            .by = c(Scenario, year)) |> 
+  left_join(
+    dn |>
+      filter(iter == 1) |> # They are the same across all iters anyway... 
+      rename(n_ref = n) |>
+      dplyr::select(-Scenario),
+    by = c("year")
+    ) |>
+  mutate(Percent = (mean / n_ref) * 100,
+         upr = ((mean + sd) / n_ref) * 100,
+         lwr = ((mean - sd) / n_ref) * 100)
+
+pd <- position_dodge(width = 0.9)
+
+ggplot(dsum, aes(year, Percent, color = Scenario)) +
+  geom_line(position = pd, linewidth = 1) +
+  scale_color_brewer(palette = "Set2") +
+  coord_cartesian(expand = 0) +
+  labs(x = "Year", y = "% of stomachs retained") +
+  theme(
+    legend.position = "bottom"
+  ) +
+  guides(fill = guide_legend(title.position = "top", title.hjust = 0.5))
+
+ggplot(dsum, aes(as.factor(year), Percent, fill = Scenario)) +
+  geom_col(position = pd, alpha = 0.75) +
+  scale_x_discrete(
+    breaks = seq(min(dsum$year), max(dsum$year), by = 4)
+    ) +
+  geom_errorbar(aes(as.factor(year), Percent, ymin = lwr, ymax = upr),
+                position = pd, alpha = 0.9, width = 0, color = "black") +
+  scale_fill_brewer(palette = "Set2") +
+  scale_color_brewer(palette = "Set2") +
+  coord_cartesian(expand = 0) +
+  labs(x = "Year", y = "% of stomachs retained") +
+  theme(
+    legend.position = "bottom"
+  ) +
+  guides(fill = guide_legend(title.position = "top", title.hjust = 0.5))
+
+ggsave(paste0(home, "/figures/sample_size.png"), width = 27, height = 17, units = "cm")
+
+# Absolute numbers instead of relative
+bind_rows(dn, s1n, s2n, s3n, s4n
+          #s5n, s6n
+          ) |> 
+  summarise(mean = mean(n),
+            sd = sd(n),
+            .by = c(Scenario, year)) |> 
+  ggplot(aes(as.factor(year), mean, fill = Scenario)) +
+  geom_col(position = "dodge", alpha = 0.9) +
+  geom_errorbar(aes(as.factor(year), mean, ymin = mean - sd, ymax = mean + sd),
+                position = pd, alpha = 0.9, width = 0, color = "black") +
+  scale_fill_brewer(palette = "Set2") +
+  coord_cartesian(expand = 0) +
+  labs(x = "Year", y = "# of stomachs retained") +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 90)
+  ) +
+  scale_y_continuous(breaks = seq(0, 5000, by = 100)) + 
+  guides(fill = guide_legend(title.position = "top", title.hjust = 0.5))
+
+ggsave(paste0(home, "/figures/abs_sample_size.png"), width = 17, height = 17, units = "cm")
+
+# Combine all scenarios for plotting and model fitting (for a given iteration)
+for (i in unique(df$scenario)) {
+  
+  sub <- df |>
+    filter(scenario == i & iter == 1) |>
+    summarise(n = length(unique(pred_id)), 
+              .by = c(ices_rect, year, month)) |> 
+    mutate(mid_lat = ices.rect(ices_rect)$lat,
+           mid_lon = ices.rect(ices_rect)$lon) |> 
+    tidylog::drop_na(mid_lat) |>
+    add_utm_columns(
+      ll_names = c("mid_lon", "mid_lat"),
+      utm_names = c("mid_X", "mid_Y"),
+      utm_crs = 32633
+    ) |>
+    distinct(ices_rect, year, .keep_all = TRUE)
+
+  plot_map_fc +
+    geom_sf(color = "gray80") +
+    geom_text(data = sub, aes(mid_X * 1000, mid_Y * 1000, label = n), size = 1.8, color = "tomato3") +
+    facet_wrap(~year) +
+    labs(caption = "Number of stomachs sampled")
+
+  ggsave(paste0(home, "/figures/supp/sample_size_map_", i, ".png"), width = 20, height = 20, units = "cm")
+}
+```
+
+```{r}
+#| message: false
+#| warning: false
+
+# Loop through all scenarios, fit model and calculate index
+
+df <- df |> filter(!scenario %in% c("s5", "s6"))
+
+inds <- list()
+inds_all <- list()
+
+df$scen_iter <- paste(df$scenario, df$iter, sep = "_")
+
+for (i in unique(df$scen_iter)) {
+  
+  dd <- df |> filter(scen_iter == i)
+
+  mesh <- make_mesh(dd, c("X", "Y"), cutoff = 15)
+
+  ggplot() +
+    inlabru::gg(mesh$mesh) +
+    coord_fixed() +
+    geom_point(aes(X, Y), data = d, alpha = 0.2, size = 0.5) +
+    annotate("text", -Inf, Inf, label = paste("n knots = ", mesh$mesh$n), hjust = -0.3, vjust = 3) +
+    labs(x = "Easting (km)", y = "Northing (km)")
+
+  #ggsave(paste0(home, "/figures/supp/diet_mesh_", i, ".png"), width = 14, height = 14, units = "cm")
+
+  # Fit models
+  missing_years <- base::setdiff(
+    min(d$year):max(d$year),
+    unique(dd$year)
+  )
+
+  tryCatch(
+    {
+    # Fit the model
+    m <- sdmTMB(
+    rpw ~ 0 + prey_group * pred_length_sc + s(year_ct, by = prey_group) + oxy_sc + temp_sc + depth_sc + salinity_sc,
+    data = dd,
+    mesh = mesh,
+    time = "year",
+    extra_time = missing_years,
+    spatial = "off",
+    spatiotemporal = "off",
+    spatial_varying = ~ 0 + prey_group,
+    family = delta_beta()
+    )
+    
+    sanity(m)
+    tidy(m)
+
+    # s <- simulate(m, nsim = 300, type = "mle-mvn")
+    # dharma_residuals(s, m)
+
+    # Calculate indices
+    for (j in unique(d$prey_group)) {
+      
+      pred_grid$prey_group <- as.factor(j)
+      
+      p <- predict(m, newdata = pred_grid, return_tmb_object = TRUE)
+      
+      t <- get_index(p, area = 1 / nrow(pred_grid |> filter(year == 2000)))
+      
+      inds[[j]] <- t |>
+        mutate(
+          prey_group = j,
+          scenario = i
+        )
+      }
+    
+  },
+  
+  error = function(e) {
+    message("⚠️ Model ", i, " failed: ", e$message)
+    NULL  # store NULL if model fails
+  }
+)  
+
+  inds_all[[i]] <- bind_rows(inds)
+
+}
+
+ind <- bind_rows(inds_all)
+
+write_csv(ind, paste0(home, "/output/index.csv"))
+```
+
+Average across iterations!
+
+```{r}
+#| message: false 
+
+ind <- read_csv(paste0(home, "/output/index.csv")) |> 
+  separate(scenario, into = c("scenario", "iteration"), remove = TRUE) #|> 
+  #filter(iteration == 1)
+
+# Add calculations to the index
+data_avg <- df |>
+  #filter(iter == 1) |> 
+  summarise(y_mean = mean(rpw), .by = c(year, scenario, prey_group))
+
+ind_sum <- ind |>
+  summarise(est = mean(est, na.rm = TRUE),
+            lwr = mean(lwr, na.rm = TRUE), 
+            upr = mean(upr, na.rm = TRUE), 
+            log_est = mean(log_est),
+            se = mean(se, na.rm = TRUE),
+            .by = c(year, prey_group, scenario)) |> 
+  left_join(data_avg, by = c("prey_group", "scenario", "year"))
+
+ind_sum
+
+# See Anderson et al for these calculations
+all_scen <- ind_sum |>
+  filter(scenario == "all") |>
+  dplyr::select(year, est, se, prey_group) |>
+  rename(
+    est_ref = est,
+    se_ref = se
+  )
+
+ind_sum |> 
+  filter(scenario == "s2")
+
+ind_comp <- ind_sum |>
+  filter(!scenario == "all") |>
+  left_join(all_scen, by = c("year", "prey_group")) |>
+  mutate(
+    precision = sqrt(exp((se^2)) - 1),
+    precision_ref = sqrt(exp((se_ref^2)) - 1),
+    CV = ((precision - precision_ref) / precision_ref) * 100,
+    RE = (est - est_ref) / est_ref,
+    abs_RE = abs(RE)) |>
+  pivot_longer(c(CV, RE, abs_RE))
+
+# Now get bias in trends over time
+slopes <- ind_comp |>
+  filter(name == "RE") |>
+  mutate(id = paste(prey_group, scenario, sep = ":")) %>%
+  split(.$id) |>
+  purrr::map(~ lm(value ~ year, data = .x)) |>
+  purrr::map_df(broom::tidy, .id = "id") |>
+  dplyr::select(id, term, estimate, std.error) |>
+  filter(term == "year") |>
+  dplyr::select(-term) |>
+  mutate(
+    lwr = estimate - 1.96 * std.error,
+    upr = estimate + 1.96 * std.error
+  ) |>
+  separate(id, into = c("prey_group", "scenario"), sep = ":") |>
+  rename(median = estimate) |>
+  mutate(name = "Trends") |>
+  dplyr::select(-std.error)
+
+ind_comp_sp <- ind_comp |>
+  summarise(
+    median = median(value, na.rm = TRUE),
+    lwr = quantile(value, probs = 0.25, na.rm = TRUE),
+    upr = quantile(value, probs = 0.75, na.rm = TRUE),
+    .by = c(name, prey_group, scenario)
+  ) |> 
+  mutate(name = ifelse(name == "abs_RE", "MARE", name)) |> 
+  filter(!name == "RE")
+
+metrics <- bind_rows(ind_comp_sp, slopes)
+
+# Plot precision, accuracy (abs_RE) and trends
+means <- metrics |>
+  summarise(mean = mean(median), .by = c(scenario, name))
+
+ggplot(metrics, aes(scenario, median, color = prey_group)) +
+  facet_wrap(~name, scales = "free_y", 
+             labeller = labeller(name = c(
+               "CV" = "% CV increase (precision loss)",
+               "MARE" = "MARE (accuracy loss)"
+             ))) +
+  annotate("rect", 
+           xmin = seq(0.5, by = 2, length.out = 2), 
+           xmax = seq(1.5, by = 2, length.out = 2),
+           ymin = -Inf, ymax = Inf, 
+           alpha = 0.1, fill = "grey70") +
+  geom_hline(yintercept = 0, alpha = 0.5, linetype = 2) +
+  geom_point(
+    data = means, aes(y = mean),
+    color = "grey30",
+    size = 3
+  ) +
+  geom_jitter(
+    width = 0,
+    height = 0,
+    alpha = 0.5,
+    size = 2
+  ) +
+  scale_color_brewer(palette = "Set2") +
+  theme(legend.position = "bottom", legend.title = element_blank()) +
+  labs(y = "Value", x = "Scenario")
+
+ggsave(paste0(home, "/figures/metrics_comp.png"),
+       width = 20, height = 8.5, units = "cm")
+
+# Plot CV and MARE against sample size
+# Calculate both CV and MARE for each iteration in one pipe
+ind_comp_sp_iter_combined <- ind |>
+  summarise(est = mean(est),
+            lwr = mean(lwr), 
+            upr = mean(upr), 
+            log_est = mean(log_est),
+            se = mean(se, na.rm = TRUE),
+            .by = c(year, prey_group, scenario, iteration)) |> 
+  filter(!scenario == "all") |>
+  left_join(all_scen, by = c("year", "prey_group")) |>
+  mutate(
+    precision = sqrt(exp((se^2)) - 1),
+    precision_ref = sqrt(exp((se_ref^2)) - 1),
+    CV = ((precision - precision_ref) / precision_ref) * 100,
+    RE = (est - est_ref) / est_ref,
+    abs_RE = abs(RE)
+  ) |>
+  # Median across years for each prey group
+  summarise(
+    CV = median(CV),
+    MARE = median(abs_RE),
+    .by = c(prey_group, scenario, iteration)
+  ) |>
+  # Median across prey groups for each iteration
+  summarise(
+    CV = median(CV),
+    MARE = median(MARE),
+    .by = c(scenario, iteration)
+  ) |>
+  pivot_longer(c(CV, MARE), names_to = "metric", values_to = "median") |>
+  rename(Scenario = scenario) |> 
+  left_join(dsum |> 
+              summarise(Percent = mean(Percent), .by = Scenario),
+            by = c("Scenario")) |> 
+  mutate(Percent = ifelse(Scenario == "s4", Percent/2, Percent))
+
+# Summary for error bars (mean across prey groups)
+metric_sample <- metrics |> 
+  filter(name %in% c("CV", "MARE")) |> 
+  summarise(median = mean(median),
+            lwr = mean(lwr),
+            upr = mean(upr),
+            .by = c(scenario, name)) |> 
+  rename(Scenario = scenario, metric = name) |> 
+  left_join(dsum |> 
+              summarise(Percent = mean(Percent), .by = Scenario),
+            by = "Scenario") |> 
+  mutate(Percent = ifelse(Scenario == "s4", Percent/2, Percent))
+
+# Create faceted plot
+ggplot(metric_sample, aes(Percent, median, label = Scenario, color = Scenario)) + 
+  facet_wrap(~metric, scales = "free_y", 
+             labeller = labeller(metric = c(
+               "CV" = "% CV increase (precision loss)",
+               "MARE" = "MARE (accuracy loss)"
+             ))) +
+  geom_jitter(data = ind_comp_sp_iter_combined, height = 0, width = 1, 
+              alpha = 0.3) +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), width = 0) +
+  geom_path(color = "grey70") + 
+  geom_point(size = 1.5, color = "grey30") +
+  #geom_label() +
+  labs(y = "Metric value",
+       x = "% stomachs") + 
+  theme(legend.position = "bottom",
+        legend.title = element_blank()) +
+  scale_color_brewer(palette = "Set2") #+
+  #guides(color = "none")
+
+ggsave(paste0(home, "/figures/cv_mare_n.png"), width = 18, height = 11, units = "cm")
+```
+
+```{r}
+# Comparing scenarios by prey group
+ggplot(ind_sum, aes(year, est, fill = scenario, color = scenario)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr),
+    alpha = 0.1, color = NA
+  ) +
+  geom_line() +
+  scale_color_brewer(palette = "Set2") +
+  scale_fill_brewer(palette = "Set2") +
+  guides(
+    fill = "none",
+    color = guide_legend(
+      position = "inside",
+      title.position = "top",
+      title.hjust = 0.5
+    )
+  ) +
+  labs(
+    y = "Relative prey weight",
+    x = "Year",
+    color = "Scenario"
+  ) +
+  facet_wrap(~prey_group, scales = "free", ncol = 2) +
+  theme(
+    legend.position.inside = c(0.75, 0.1),
+    legend.direction = "horizontal"
+  ) +
+  NULL
+
+ggsave(paste0(home, "/figures/scenario_comp.png"), width = 17, height = 17, units = "cm")
+
+# Prey composition by scenario
+ggplot(ind_sum, aes(year, est, fill = prey_group)) +
+  geom_area(stat = "identity", alpha = 0.8) +
+  facet_wrap(~scenario, ncol = 2) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    y = "Relative prey weight",
+    x = "Year",
+    fill = "Prey group"
+  ) +
+  guides(fill = guide_legend(
+    position = "inside",
+    ncol = 2,
+    title.position = "top",
+    title.hjust = 0.5
+  )) +
+  coord_cartesian(expand = 0) +
+  theme(
+    legend.position.inside = c(0.75, 0.1),
+    legend.direction = "horizontal"
+  ) +
+  NULL
+
+ggsave(paste0(home, "/figures/prey_comp.png"), width = 17, height = 17, units = "cm")
+
+
+# Loop through each scenario + species
+for (i in unique(ind$prey_group)) {
+  
+  sub <- ind_sum |>
+    rename(data = y_mean) |>
+    pivot_longer(c("est", "data")) |>
+    filter(prey_group == i)
+
+  sub_ind <- ind |>
+    filter(prey_group == i) |> 
+    filter(!scenario == "all")
+
+  ggplot() +
+    facet_wrap(~scenario, ncol = 2) +
+    geom_ribbon(
+      data = sub |> filter(name == "est"),
+      aes(year, value, ymin = lwr, ymax = upr),
+      alpha = 0.2, color = NA
+    ) +
+    geom_line(
+      data = sub_ind, inherit.aes = FALSE, color = "grey30",
+      aes(year, est, group = iteration), alpha = 0.18, linewidth = 0.3,
+    ) +
+    geom_line(
+      data = sub |> filter(name == "est"),
+      linetype = 2,
+      aes(year, value, color = name)
+    ) +
+    geom_point(
+      data = sub |> filter(name == "data"),
+      aes(year, value, color = name), alpha = 0.5
+    ) +
+    guides(color = guide_legend(
+      position = "inside",
+      ncol = 2
+    )) +
+    coord_cartesian(expand = 0) +
+    theme_sleek(base_size = 13)+
+    theme(
+      legend.title = element_blank(),
+      legend.position.inside = c(0.75, 0.1),
+      legend.direction = "horizontal"
+      ) +
+    scale_color_brewer(palette = "Set2") +
+    scale_fill_brewer(palette = "Set2") +
+    labs(
+      y = "Relative prey weight",
+      x = "Year"
+    )
+
+  ggsave(paste0(home, "/figures/supp/index_vs_data_", i, ".png"), width = 17, height = 17, units = "cm")
+}
+```
+
+```{r}
+# s6 |>
+#   summarise(n = length(unique(pred_id)),
+#             .by = c(year, quarter, ices_rect, length_group, Country)) |> 
+#   arrange(desc(n))
+```
+
+## For a given year, prey group and predator length, how many samples until asymptotic estimate? (non-spatial approach)
+
+```{r}
+#| message: false 
+# # Generate random data
+# # https://stackoverflow.com/questions/69141793/simulate-in-r-the-number-of-samples-needed-in-order-to-achieve-the-true-standard
+# 
+# # Define the sample sizes
+# sample_size <- 1:1300
+# 
+# # Function to calculate sigma_m
+# calc_mean <- function(n, x) {
+#   mean(sample(x, n, replace = TRUE))
+# }
+# 
+# d <- d |>
+#   mutate(
+#     life_stage = ifelse(pred_length > 25, "Adult", "Juvenile"),
+#     id = paste(prey_group, life_stage, sep = ":")
+#   )
+# 
+# cumulative_means <- list()
+# 
+# for (i in unique(d$id)) {
+#   x <- d |> filter(id == i)
+# 
+#   dft <- tibble(sample_size) |>
+#     mutate(mean = map_dbl(sample_size, ~ calc_mean(.x, x$rpw)))
+# 
+#   cumulative_means[[i]] <- dft |> mutate(id = i)
+# }
+# 
+# cm <- bind_rows(cumulative_means) |>
+#   separate(id, into = c("prey_group", "life_stage"), sep = ":")
+# 
+# ggplot(cm, aes(sample_size, mean, color = life_stage)) +
+#   facet_wrap(~prey_group, scales = "free_y", ncol = 2) +
+#   geom_line(alpha = 0.8) +
+#   labs(x = "Sample size", y = "Mean", color = "Prey group") +
+#   scale_color_brewer(palette = "Set2") +
+#   guides(color = guide_legend(
+#     position = "inside",
+#     ncol = 2,
+#     title.position = "top",
+#     title.hjust = 0.5
+#   )) +
+#   theme(
+#     legend.position.inside = c(0.75, 0.1),
+#     legend.direction = "horizontal"
+#   ) +
+#   coord_cartesian(xlim = c(0, 300)) +
+#   NULL
+# 
+# ggsave(paste0(home, "/figures/supp/cumulative_means.png"), width = 17, height = 17, units = "cm")
+# 
+# cm_sum <- cm |>
+#   mutate(sample_group = cut(sample_size, breaks = seq(0, 1300, by = 5))) |>
+#   summarise(
+#     sd = sd(mean),
+#     mean = mean(mean),
+#     cv = sd / mean,
+#     .by = c(sample_group, life_stage, prey_group)
+#   ) |>
+#   separate(sample_group, into = c("lwr", "upr"), sep = ",") |>
+#   mutate(upr = as.numeric(str_remove(upr, "]")))
+# 
+# ggplot(cm_sum, aes(upr, cv, linetype = life_stage)) +
+#   facet_wrap(~prey_group, scales = "free_y", ncol = 2) +
+#   geom_line(alpha = 0.8) +
+#   geom_smooth(method = "gam", formula = y ~ s(x, k = 3), se = FALSE, linewidth = 0.5) +
+#   labs(x = "Sample size", y = "CV", color = "Scenario", linetype = "Life stage") +
+#   scale_color_brewer(palette = "Set2") +
+#   guides(color = guide_legend(
+#     position = "inside",
+#     title.position = "top",
+#     title.hjust = 0.5
+#   ),
+#   linetype = guide_legend(
+#     position = "inside",
+#     title.position = "top",
+#     title.hjust = 0.5
+#   )) +
+#   theme(
+#     legend.position.inside = c(0.75, 0.1),
+#     legend.direction = "horizontal"
+#   ) +
+#   geom_vline(data = dsum |> summarise(n = mean(mean), .by = Scenario),
+#              aes(xintercept = n, color = Scenario)) +
+#   NULL
+# 
+# ggsave(paste0(home, "/figures/supp/cumulative_cv_with_data.png"), width = 17, height = 17, units = "cm")
+```
+
+```{r}
+ggplot(metrics, aes(median, prey_group)) +
+  ggh4x::facet_grid2(scenario ~ factor(name, levels = c("CV", "MARE", "Trends")),
+    scales = "free_x",
+    labeller = labeller(
+      `factor(name, levels = c("CV", "MARE", "Trends"))` = c(
+        "CV" = "% increase CV\n(precision loss)",
+        "MARE" = "MARE\n(accuracy loss)", 
+        "Trends" = "RE trend\n(trend bias)")
+  )) +
+  geom_vline(xintercept = 0, alpha = 0.8, color = "grey30") +
+  geom_vline(
+    data = means, aes(xintercept = mean),
+    alpha = 0.8, linetype = 2, color = "tomato3"
+  ) +
+  geom_point(position = position_dodge(width = 0.2), color = "steelblue") +
+  geom_errorbar(aes(median, prey_group, xmin = lwr, xmax = upr),
+    width = 0,
+    alpha = 0.3, position = position_dodge(width = 0.2),
+    color = "steelblue"
+  ) +
+  scale_color_brewer(palette = "Set2") +
+  theme(
+    axis.title.x = element_blank(),
+    legend.position = "bottom",
+    legend.title = element_blank()
+  ) +
+  labs(x = "% change", y = "Scenario")
+#ggsave(paste0(home, "/figures/metrics_comp.png"), width = 20, height = 14, units = "cm")
+```
+

@@ -1,0 +1,384 @@
+---
+title: "Make the prediction grid"
+author: "Max Lindmark"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format: 
+  html:
+    embed-resources: true
+    fig-width: 8
+    #fig-asp: 0.618
+knitr: 
+  opts_chunk:
+    fig.align: center
+editor: source
+execute: 
+  echo: true
+  eval: true
+  cache: false
+---
+
+## Intro
+Make an evenly spaced UTM prediction grid with all spatially varying covariates for the diet and the biomass data
+
+```{r lib}
+#| message: false
+
+library(tidyverse)
+library(tidync)
+library(tidyterra)
+library(tidylog)
+library(sp)
+library(raster)
+library(devtools)
+library(RCurl)
+library(sdmTMB)
+library(terra)
+library(ncdf4)
+library(chron)
+library(viridis)
+library(readxl)
+
+library(ggsidekick); theme_set(theme_sleek()) # devtools::install_github("seananderson/ggsidekick") # not on CRAN 
+
+# Source code for map plots
+devtools::source_url("https://raw.githubusercontent.com/maxlindmark/pred-prey-overlap/main/R/functions/map-plot.R")
+
+# Set path
+home <- here::here()
+```
+
+Read data and depth-raster
+
+```{r depth}
+#| message: false
+
+# Read data
+d <- readr::read_csv("https://raw.githubusercontent.com/maxlindmark/spatial-metabolic-index/main/data/clean/catch_clean.csv") |> 
+  rename(X = x, Y = y) 
+```
+
+## Make the grid with depth
+First make a grid for the biomass data, then subset that based on the extend of the stomach data
+
+```{r make pred grid}
+#| message: false
+
+x <- d$X
+y <- d$Y
+z <- chull(x, y)
+
+coords <- cbind(x[z], y[z])
+
+coords <- rbind(coords, coords[1, ])
+
+plot(coords[, 1] ~ coords[, 2]) # plot data
+
+sp_poly <- sp::SpatialPolygons(
+  list(sp::Polygons(list(sp::Polygon(coords)), ID = 1))
+  )
+
+sp_poly_df <- sp::SpatialPolygonsDataFrame(sp_poly,
+                                           data = data.frame(ID = 1)
+                                           )
+cell_width <- 3
+
+pred_grid <- expand.grid(
+  X = seq(min(d$X), max(d$X), cell_width),
+  Y = seq(min(d$Y), max(d$Y), cell_width),
+  year = c(1993:2023)
+  )
+
+ggplot(pred_grid |> filter(year == 2019), aes(X, Y)) +
+  geom_point(size = 0.1) +
+  theme_void() +
+  coord_sf()
+
+sp::coordinates(pred_grid) <- c("X", "Y")
+
+inside <- !is.na(sp::over(pred_grid, as(sp_poly_df, "SpatialPolygons")))
+
+pred_grid <- pred_grid[inside, ]
+
+pred_grid <- as.data.frame(pred_grid)
+
+ggplot(data = filter(pred_grid, year == 1999), aes(X*1000, Y*1000)) + 
+  geom_point(size = 0.001, alpha = 0.5) +
+  NULL
+
+plot_map +
+  geom_point(data = filter(pred_grid, year == 1999), aes(X*1000, Y*1000), size = 0.001, alpha = 0.5) +
+  NULL
+
+# Add lat and lon
+# Need to go from UTM to lat long for this one...
+# https://stackoverflow.com/questions/30018098/how-to-convert-utm-coordinates-to-lat-and-long-in-r
+xy <- as.matrix(pred_grid |> dplyr::select(X, Y) |> mutate(X = X*1000, Y = Y*1000))
+v <- vect(xy, crs="+proj=utm +zone=33 +datum=WGS84  +units=m")
+y <- project(v, "+proj=longlat +datum=WGS84")
+lonlat <- geom(y)[, c("x", "y")]
+
+pred_grid$lon <- lonlat[, 1]
+pred_grid$lat <- lonlat[, 2]
+
+ggplot(filter(pred_grid, year == 1999), aes(lon, lat)) + geom_point()
+
+# Add depth now to remove islands and remaining land
+# https://gis.stackexchange.com/questions/411261/read-multiple-layers-raster-from-ncdf-file-using-terra-package
+# https://emodnet.ec.europa.eu/geoviewer/
+dep_raster <- terra::rast("/Users/maxlindmark/Dropbox/Max work/R/pred-prey-overlap/data/covariates/depth/Mean depth natural colour (with land).nc")
+class(dep_raster)
+crs(dep_raster, proj = TRUE)
+
+plot(dep_raster)
+
+pred_grid$depth <- terra::extract(dep_raster, pred_grid |> dplyr::select(lon, lat))$elevation
+
+ggplot(pred_grid, aes(lon, lat, color = depth*-1)) + 
+  geom_point()
+
+pred_grid$depth <- pred_grid$depth*-1
+
+pred_grid <- pred_grid |> drop_na(depth)
+
+pred_grid |> 
+  filter(year == 1999) |> 
+  drop_na(depth) |> 
+  #mutate(water = ifelse(depth < 0.00000001, "N", "Y")) |> 
+  ggplot(aes(X*1000, Y*1000, fill = depth)) + 
+  geom_raster() +
+  NULL
+
+plot_map + 
+  geom_point(data = pred_grid, aes(X*1000, Y*1000), size = 0.001) + 
+  geom_sf()
+
+plot_map + 
+  geom_raster(data = filter(pred_grid, year == 1999), aes(X*1000, Y*1000, fill = depth), size = 0.001) + 
+  geom_sf()
+```
+
+Add month_year variable for matching with raster layers
+
+```{r merge quarters}
+#| message: false
+
+dat <- replicate_df(pred_grid, "quarter", c(1, 4)) |> 
+   mutate(month = ifelse(quarter == 1, 2, 11), # most common months
+          month_year = paste(month, year, sep = "_"))
+```
+
+## Add ICES areas
+
+```{r ices areas}
+#| message: false
+
+# https://stackoverflow.com/questions/34272309/extract-shapefile-value-to-point-with-r
+# https://gis.ices.dk/sf/
+shape <- shapefile(paste0(home, "/data/shapefiles/ICES-StatRec-mapto-ICES-Areas/StatRec_map_Areas_Full_20170124.shp"))
+head(shape)
+
+pts <- SpatialPoints(cbind(dat$lon, dat$lat), 
+                     proj4string = CRS(proj4string(shape)))
+
+dat$subdiv <- over(pts, shape)$Area_27
+
+# Rename subdivisions to the more common names and do some more filtering (by sub div and area)
+sort(unique(dat$subdiv))
+
+dat <- dat |> 
+  mutate(sub_div = factor(subdiv),
+         sub_div = fct_recode(subdiv,
+                              "24" = "3.d.24",
+                              "25" = "3.d.25",
+                              "26" = "3.d.26",
+                              "27" = "3.d.27",
+                              "28" = "3.d.28.1",
+                              "28" = "3.d.28.2",
+                              "29" = "3.d.29"),
+         sub_div = as.character(sub_div)) |> 
+  filter(sub_div %in% c("24", "25", "26", "27", "28", 2)) |> 
+  filter(lat > 54 & lat < 59 & lon < 22)
+
+# Add ICES rectangles
+dat$ices_rect <- mapplots::ices.rect2(lon = dat$lon, lat = dat$lat)
+
+dat <- dat |> dplyr::select(-subdiv)
+```
+
+## Add environmental covariates
+
+#### Oxygen
+
+```{r oxygen}
+#| message: false
+
+covPath <- "/Users/maxlindmark/Dropbox/Max work/R/pred-prey-overlap/data/covariates/"
+
+# Source: 
+# https://data.marine.copernicus.eu/product/BALTICSEA_ANALYSISFORECAST_BGC_003_007/download?dataset=cmems_mod_bal_bgc_anfc_P1M-m_202311
+# https://data.marine.copernicus.eu/product/BALTICSEA_MULTIYEAR_BGC_003_012/download?dataset=cmems_mod_bal_bgc_my_P1M-m_202303
+# Print details
+print(nc_open(paste(covPath, "oxygen", "cmems_mod_bal_bgc_my_P1M-m_1718018848983.nc", sep = "/")))
+
+oxy_tibble <- tidync(paste(covPath, "oxygen",
+                           "cmems_mod_bal_bgc_my_P1M-m_1718018848983.nc", sep = "/")) |>
+  hyper_tibble() |> 
+  mutate(date = as_datetime(time, origin = '1970-01-01')) |>
+  mutate(month = month(date),
+         day = day(date),
+         year = year(date),
+         month_year = paste(month, year, sep = "_"),
+         oxy = o2b * 0.0223909)
+
+# Now do recent data (forecast)
+print(nc_open(paste(covPath, "oxygen", "cmems_mod_bal_bgc_anfc_P1M-m_1718022118172.nc", sep = "/")))
+
+oxy_tibble_new <- tidync(paste(covPath, "oxygen",
+                            "cmems_mod_bal_bgc_anfc_P1M-m_1718022118172.nc", sep = "/")) |>
+  hyper_tibble() |> 
+  mutate(date = as_datetime(time, origin = '1970-01-01')) |>
+  mutate(month = month(date),
+         day = day(date),
+         year = year(date),
+         month_year = paste(month, year, sep = "_"),
+         oxy = o2b * 0.0223909) |> 
+  filter(year > 2021)
+
+oxy_tibble <- bind_rows(oxy_tibble, oxy_tibble_new)
+
+# Loop through all year combos, extract the temperatures at the data locations
+oxy_list <- list()
+
+for(i in unique(dat$month_year)) {
+  
+  d_sub <- filter(dat, month_year == i)
+  oxy_tibble_sub <- filter(oxy_tibble, month_year == i)
+  
+  # Convert to raster
+  ggplot(oxy_tibble_sub, aes(longitude, latitude)) + 
+    geom_point(size = 0.1)
+  
+  oxy_raster <- as_spatraster(oxy_tibble_sub, xycols = 2:3,
+                              crs = "WGS84", digits = 3)
+
+  ggplot() +
+    geom_spatraster(data = oxy_raster$oxy, aes(fill = oxy)) + 
+    scale_fill_viridis(option = "magma") +
+    ggtitle(i)
+
+  # Extract from raster
+  d_sub$oxy <- terra::extract(oxy_raster$oxy,
+                              d_sub |> dplyr::select(lon, lat))$oxy  
+   
+  # Save
+  oxy_list[[i]] <- d_sub
+  
+}
+
+d_oxy <- bind_rows(oxy_list)
+```
+
+#### Temperature & Salinity
+
+```{r temperature}
+#| message: false
+
+# Source
+# https://data.marine.copernicus.eu/product/BALTICSEA_MULTIYEAR_PHY_003_011/description
+# https://data.marine.copernicus.eu/product/BALTICSEA_ANALYSISFORECAST_PHY_003_006/description
+# Print details
+print(nc_open(paste(covPath, "temperature_salinity", "cmems_mod_bal_phy_my_P1M-m_1718087629163.nc", sep = "/")))
+
+st_tibble <- tidync(paste(covPath, "temperature_salinity",
+                          "cmems_mod_bal_phy_my_P1M-m_1718087629163.nc", sep = "/")) |>
+  hyper_tibble() |> 
+  mutate(date = as_datetime(time, origin = '1970-01-01')) |>
+  mutate(month = month(date),
+         day = day(date),
+         year = year(date),
+         month_year = paste(month, year, sep = "_"))
+
+# Now do recent data (forecast)
+print(nc_open(paste(covPath, "temperature_salinity", "cmems_mod_bal_phy_anfc_P1M-m_1718087127439.nc", sep = "/")))
+
+st_tibble_new <- tidync(paste(covPath, "temperature_salinity",
+                              "cmems_mod_bal_phy_anfc_P1M-m_1718087127439.nc", sep = "/")) |>
+  hyper_tibble() |> 
+  mutate(date = as_datetime(time, origin = '1970-01-01')) |>
+  mutate(month = month(date),
+         day = day(date),
+         year = year(date),
+         month_year = paste(month, year, sep = "_")) |> 
+  filter(year > 2021)
+
+st_tibble <- bind_rows(st_tibble, st_tibble_new)
+
+# Loop through all year combos, extract the temperatures at the data locations
+st_list <- list()
+
+for(i in unique(dat$month_year)) {
+  
+  d_sub <- filter(dat, month_year == i)
+  st_tibble_sub <- filter(st_tibble, month_year == i)
+  
+  # Convert to raster
+  ggplot(st_tibble_sub, aes(longitude, latitude)) + 
+    geom_point(size = 0.1)
+  
+  st_raster <- as_spatraster(st_tibble_sub, xycols = 3:4,
+                             crs = "WGS84", digits = 3)
+
+  ggplot() +
+    geom_spatraster(data = st_raster$bottomT, aes(fill = bottomT)) + 
+    scale_fill_viridis(option = "magma") +
+    ggtitle(i)
+  
+  ggplot() +
+    geom_spatraster(data = st_raster$sob, aes(fill = sob)) + 
+    scale_fill_viridis(option = "magma") +
+    ggtitle(i)
+
+  # Extract from raster
+  d_sub$temp <- terra::extract(st_raster$bottomT,
+                               d_sub |> dplyr::select(lon, lat))$bottomT
+  
+  d_sub$salinity <- terra::extract(st_raster$sob,
+                                   d_sub |> dplyr::select(lon, lat))$sob  
+   
+  # Save
+  st_list[[i]] <- d_sub
+  
+}
+
+d_st <- bind_rows(st_list)
+```
+
+```{r join environmental data}
+#| message: false
+
+env_dat <- d_st |> 
+  left_join(d_oxy |> dplyr::select(-X, -Y, -depth, -quarter, -year, -month),
+            by = c("month_year", "lon", "lat")) |> 
+  dplyr::select(month_year, lon, lat, temp, salinity, oxy)
+```
+
+```{r merge oxygen temp and salinity data with fish data}
+#| message: false
+
+# Now join these data with the full_dat
+dat_full <- left_join(dat, env_dat, by = c("month_year", "lon", "lat")) |> 
+  drop_na(temp, salinity, oxy)
+```
+
+## Save
+
+```{r save}
+#| message: false
+
+# Remove variables and save
+pred_grid_93_08 <- dat_full |> filter(year <= 2008)
+pred_grid_09_23 <- dat_full |> filter(year >= 2009)
+
+write_csv(pred_grid_93_08, file = paste0(home, "/data/clean/pred_grid_(1_2).csv"))
+write_csv(pred_grid_09_23, file = paste0(home, "/data/clean/pred_grid_(2_2).csv"))
+```

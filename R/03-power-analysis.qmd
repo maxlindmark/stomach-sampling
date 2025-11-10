@@ -1,0 +1,839 @@
+---
+title: "Stomach power analysis"
+author: "Max Lindmark"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format: 
+  html:
+    page-layout: full
+    embed-resources: true
+knitr: 
+  opts_chunk:
+    fig.align: center
+    out-width: 80%
+editor: source
+execute: 
+  echo: true
+  eval: true
+  cache: false
+---
+
+## Load libraries
+
+```{r libs}
+#| message: false
+#| warning: false
+#| cache: false
+
+library(tidyverse)
+library(devtools)
+library(sdmTMB)
+library(sdmTMBextra)
+library(viridis)
+library(egg)
+library(tictoc)
+library(mapplots)
+library(tictoc)
+library(purrr)
+library(patchwork)
+library(ggdist)
+library(viridis)
+library(geomtextpath)
+library(ggbeeswarm)
+
+# Set path
+home <- here::here()
+
+devtools::source_url("https://raw.githubusercontent.com/maxlindmark/pred-prey-overlap/main/R/functions/map-plot.R")
+
+set.seed(99)
+```
+
+```{r load cache}
+# To load entire cache in interactive r session, do:
+# qwraps2::lazyload_cache_dir(path = paste0(home, "/R/main-analysis/02-fit-diet-models_cache/html"))
+```
+
+## Read cleaned data
+
+```{r}
+#| message: false
+#| warning: false
+
+d <- read_csv(paste0(home, "/data/clean/stomachs.csv")) |>
+  pivot_wider(names_from = "prey_group", values_from = "rpw") |> 
+  mutate(Other = Other + `Other invertebrates` + `Other pisces` + Saduria) |> 
+  dplyr::select(-`Other invertebrates`, -`Other pisces`, -Saduria) |> 
+  pivot_longer(c("Other", "Sprat", "Herring"),
+               names_to = "prey_group", values_to = "rpw") |> 
+  filter(year >= 2014) |> # 10 years of data
+  mutate(
+    year_f = as.factor(year),
+    month_f = as.factor(month)
+  ) |>
+  filter(quarter %in% c(1, 4)) |>
+  mutate(across(
+    .cols = c("oxy", "temp", "depth", "salinity", "pred_length"),
+    .fns = scale,
+    .names = "{.col}_sc"
+  )) |>
+  # Instead of filtering high rpw, I assign them the max
+  mutate(rpw = ifelse(rpw > 0.5, 0.5, rpw)) |>
+  mutate(
+    prey_group = as.factor(prey_group),
+    year_ct = year - 2014
+  ) |> 
+  dplyr::select(rpw, prey_group, year, year_ct, pred_length, pred_length_sc,
+                depth_sc, pred_length_sc, X, Y, haul_id)
+```
+
+Fit a basic model which we simulate from
+
+```{r}
+mesh_her <- make_mesh(d |> filter(prey_group == "Herring"),
+                      c("X", "Y"), cutoff = 15)
+
+mesh_oth <- make_mesh(d |> filter(prey_group == "Other"),
+                      c("X", "Y"), cutoff = 15)
+
+mesh_spr <- make_mesh(d |> filter(prey_group == "Sprat"),
+                      c("X", "Y"), cutoff = 15)
+
+ggplot() +
+  inlabru::gg(mesh_her$mesh) +
+  coord_fixed() +
+  geom_point(aes(X, Y), data = d, alpha = 0.2, size = 0.5) +
+  labs(x = "Easting (km)", y = "Northing (km)")
+
+# Fit
+m_her <- sdmTMB(
+  rpw ~ pred_length_sc + year_ct + depth_sc,
+  data = d |> filter(prey_group == "Herring"),
+  mesh = mesh_her,
+  time = "year",
+  spatial = "on",
+  spatiotemporal = "off", # FIXME: For speed!
+  tweedie()
+  )
+
+sanity(m_her)
+
+m_oth <- sdmTMB(
+  rpw ~ pred_length_sc + year_ct + depth_sc,
+  data = d |> filter(prey_group == "Other"),
+  mesh = mesh_oth,
+  time = "year",
+  spatial = "on",
+  spatiotemporal = "off", # FIXME: For speed!
+  tweedie()
+  )
+
+sanity(m_oth)
+
+m_spr <- sdmTMB(
+  rpw ~ pred_length_sc + year_ct + depth_sc,
+  data = d |> filter(prey_group == "Sprat"),
+  mesh = mesh_spr,
+  time = "year",
+  spatial = "on",
+  spatiotemporal = "off", # FIXME: For speed!
+  tweedie()
+  )
+
+sanity(m_spr)
+```
+
+Make fake haul locations with cod
+
+```{r}
+# Create fake haul level data, 100 hauls each with 10 cod
+haul_pool <- d |> 
+  distinct(haul_id, .keep_all = TRUE)
+
+years <- min(d$year):max(d$year)
+
+sim_dat <- tibble(year = years) |> 
+  group_by(year) |>
+  group_modify(~ haul_pool |> 
+                 select(-year) |>
+                 slice_sample(n = 100, replace = TRUE)) |>
+  ungroup() |>
+  mutate(reps = 10) |>
+  uncount(reps) |>
+  mutate(pred_length_sc = runif(min(d$pred_length_sc), 
+                                max(d$pred_length_sc),
+                                n = n()))
+
+# Make mesh for simulating data
+mesh <- make_mesh(sim_dat, c("X", "Y"), cutoff = 15)
+```
+
+Now, in one big chunk, simulate and fit data, given year slopes & retention rates, for each simulated data set (`n_sims` data sets per combination)
+
+```{r}
+tic()
+# Set up simulation scenarios
+year_slopes <- seq(-0.04, 0, length.out = 15)
+retention_rates <- seq(0.1, 1, length.out = 15)
+n_sims <- 35
+
+# Make a data frame of all scenarios (slope*retention*simulated_data)
+sim_plan <- expand.grid(
+  slope_id = 1:length(year_slopes),
+  retention_id = 1:length(retention_rates),
+  sim_num = 1:n_sims
+) |> 
+  mutate(
+    true_slope = year_slopes[slope_id],
+    retention_rate = retention_rates[retention_id],
+    loop_id = row_number()
+  )
+
+# How many simulations in total?
+nrow(sim_plan)
+
+# Create model list
+models_list <- list(
+  Herring = m_her,
+  Sprat = m_spr,
+  Other = m_oth
+)
+
+# Simulate and fit on-the-fly to not pre-overload ram by building a massive data frame
+out_list <- list()
+est_list <- list()
+
+for (i in 1:nrow(sim_plan)) {
+  
+  slope_val <- sim_plan$true_slope[i]
+  retention_val <- sim_plan$retention_rate[i]
+  sim_val <- sim_plan$sim_num[i]
+  
+  for(model_name in names(models_list)) {
+    
+    m <- models_list[[model_name]]
+    
+    # Get parameters
+    coefs <- tidy(m, effects = "fixed")
+    ran_pars <- tidy(m, effects = "ran_pars")
+    B <- coefs$estimate
+    names(B) <- coefs$term
+    B["year_ct"] <- slope_val
+    range <- ran_pars$estimate[ran_pars$term == "range"]
+    sigma_O <- ran_pars$estimate[ran_pars$term == "sigma_O"]
+    phi <- ran_pars$estimate[ran_pars$term == "phi"]
+    tweedie_p <- ran_pars$estimate[ran_pars$term == "tweedie_p"]
+    
+    # Simulate new data given locations in sim dat and parameters
+    sim_data <- sdmTMB_simulate(
+      formula = ~ pred_length_sc + year_ct + depth_sc,
+      data = sim_dat,
+      mesh = mesh,
+      family = tweedie(link = "log"),
+      time = "year",
+      B = B,
+      range = range,
+      sigma_O = sigma_O,
+      phi = phi,
+      tweedie_p = tweedie_p,
+      seed = sim_val * 1000 + i
+    )
+    
+    # Subsample the data based on retention rate
+    sim_data_subset <- sim_data |>
+      slice_sample(prop = retention_val)
+    
+    # Fit model to subsampled data
+    mesh_subset <- make_mesh(sim_data_subset, c("X", "Y"), cutoff = 15)
+    
+    m_i <- sdmTMB(
+      observed ~ pred_length_sc + year_ct + depth_sc,
+      data = sim_data_subset,
+      mesh = mesh_subset,
+      time = "year",
+      spatial = "on",
+      spatiotemporal = "off",
+      family = tweedie()
+    )
+    
+    out_list[[model_name]] <- tidy(m_i) |> 
+      mutate(
+        true_slope = slope_val,
+        retention_rate = retention_val,
+        sim_num = sim_val,
+        model = model_name
+      )
+  }
+  
+  est_list[[i]] <- bind_rows(out_list)
+
+}
+
+est_df <- bind_rows(est_list)
+
+write_csv(est_df, paste0(home, "/output/est_df.csv"))
+
+toc()
+```
+
+```{r}
+est_df <- read_csv(paste0(home, "/output/est_df.csv"))
+```
+
+Now repeat and do 5 years instead of 10
+
+```{r}
+# Create fake haul level data, 100 hauls each with 10 cod
+haul_pool <- d |> 
+  distinct(haul_id, .keep_all = TRUE)
+
+years <- 2019:max(d$year)
+length(years)
+
+sim_dat <- tibble(year = years) |> 
+  group_by(year) |>
+  group_modify(~ haul_pool |> 
+                 select(-year) |>
+                 slice_sample(n = 100, replace = TRUE)) |>
+  ungroup() |>
+  mutate(reps = 10) |>
+  uncount(reps) |>
+  mutate(pred_length_sc = runif(min(d$pred_length_sc), 
+                                max(d$pred_length_sc),
+                                n = n()))
+
+# Make mesh for simulating data
+mesh <- make_mesh(sim_dat, c("X", "Y"), cutoff = 15)
+```
+
+```{r}
+tic()
+# Set up simulation scenarios
+year_slopes <- seq(-0.04, 0, length.out = 15)
+retention_rates <- seq(0.1, 1, length.out = 15)
+n_sims <- 35
+
+# Make a data frame of all scenarios (slope*retention*simulated_data)
+sim_plan <- expand.grid(
+  slope_id = 1:length(year_slopes),
+  retention_id = 1:length(retention_rates),
+  sim_num = 1:n_sims
+) |> 
+  mutate(
+    true_slope = year_slopes[slope_id],
+    retention_rate = retention_rates[retention_id],
+    loop_id = row_number()
+  )
+
+# How many simulations in total?
+nrow(sim_plan)
+
+# Create model list
+models_list <- list(
+  Herring = m_her,
+  Sprat = m_spr,
+  Other = m_oth
+)
+
+# Simulate and fit on-the-fly to not pre-overload ram by building a massive data frame
+out_list <- list()
+est_list <- list()
+
+for (i in 1:nrow(sim_plan)) {
+  
+  slope_val <- sim_plan$true_slope[i]
+  retention_val <- sim_plan$retention_rate[i]
+  sim_val <- sim_plan$sim_num[i]
+  
+  for(model_name in names(models_list)) {
+    
+    m <- models_list[[model_name]]
+    
+    # Get parameters
+    coefs <- tidy(m, effects = "fixed")
+    ran_pars <- tidy(m, effects = "ran_pars")
+    B <- coefs$estimate
+    names(B) <- coefs$term
+    B["year_ct"] <- slope_val
+    range <- ran_pars$estimate[ran_pars$term == "range"]
+    sigma_O <- ran_pars$estimate[ran_pars$term == "sigma_O"]
+    phi <- ran_pars$estimate[ran_pars$term == "phi"]
+    tweedie_p <- ran_pars$estimate[ran_pars$term == "tweedie_p"]
+    
+    # Simulate new data given locations in sim dat and parameters
+    sim_data <- sdmTMB_simulate(
+      formula = ~ pred_length_sc + year_ct + depth_sc,
+      data = sim_dat |> filter(year >= 2019),
+      mesh = mesh,
+      family = tweedie(link = "log"),
+      time = "year",
+      B = B,
+      range = range,
+      sigma_O = sigma_O,
+      phi = phi,
+      tweedie_p = tweedie_p,
+      seed = sim_val * 1000 + i
+    )
+    
+    # Subsample the data based on retention rate
+    sim_data_subset <- sim_data |>
+      slice_sample(prop = retention_val)
+    
+    # Fit model to subsampled data
+    mesh_subset <- make_mesh(sim_data_subset, c("X", "Y"), cutoff = 15)
+    
+    m_i <- sdmTMB(
+      observed ~ pred_length_sc + year_ct + depth_sc,
+      data = sim_data_subset,
+      mesh = mesh_subset,
+      time = "year",
+      spatial = "on",
+      spatiotemporal = "off",
+      family = tweedie()
+    )
+    
+    out_list[[model_name]] <- tidy(m_i) |> 
+      mutate(
+        true_slope = slope_val,
+        retention_rate = retention_val,
+        sim_num = sim_val,
+        model = model_name
+      )
+  }
+  
+  est_list[[i]] <- bind_rows(out_list)
+
+}
+
+est_df_5 <- bind_rows(est_list)
+
+write_csv(est_df_5, paste0(home, "/output/est_df_5.csv"))
+
+toc()
+```
+
+```{r}
+est_df_5 <- read_csv(paste0(home, "/output/est_df_5.csv"))
+```
+
+Plot how well we can retrieve the correct value from the full data set
+
+```{r}
+ddw <- 0.85 # dodge width
+
+# Create position object for consistent jittering
+pos <- position_jitter(width = 0.01, height = 0, seed = 123)
+
+# Calculate summary statistics for pointrange
+summary_df <- est_df |>
+  filter(retention_rate == 1) |> 
+  filter(term == "year_ct") |>
+  summarise(
+    mean_est = mean(estimate),
+    ymin = quantile(estimate, 0.25),
+    ymax = quantile(estimate, 0.75),
+    .by = c(true_slope, model) 
+  )
+
+hline_df <- tibble(
+  true_slope = unique(est_df$true_slope),
+  hline_val = year_slopes
+)
+
+plot_slopes <- unique(est_df$true_slope)[seq(1, 30, by = 2)]
+
+pal <- viridis(length(plot_slopes) + 1, option = "mako", begin = 0.3, end = 0.8)[1:length(plot_slopes)]
+
+# Main plot
+est_df |>
+  filter(term == "year_ct") |> 
+  filter(true_slope %in% plot_slopes) |> 
+  ggplot(aes(true_slope, estimate, 
+             fill = as.factor(true_slope), color = as.factor(true_slope))) +
+  facet_wrap(~model, scales = "free") +
+  geom_hline(
+    data = hline_df |> filter(true_slope %in% plot_slopes),
+    aes(yintercept = hline_val, color = as.factor(true_slope)),
+    linetype = 2, alpha = 0.8
+    ) +
+  geom_quasirandom(alpha = 0.2, size = 0.1) +
+  geom_pointrange(
+    data = summary_df |> filter(true_slope %in% plot_slopes),
+    aes(true_slope, mean_est, ymin = ymin, ymax = ymax,
+        color = as.factor(true_slope)),
+    #position = position_dodge(width = ddw), 
+    size = 0.5,
+    inherit.aes = FALSE
+  ) +
+  scale_fill_manual(values = pal) +
+  scale_color_manual(values = pal) +
+  labs(
+    x = "True year slope", 
+    y = "Estimated year slope"
+    ) +
+  guides(
+    color = "none",
+    fill = "none"
+  )
+
+ggsave(paste0(home, "/figures/basic_sim_retrieval.png"),
+       width = 20, height = 8.5, units = "cm")
+```
+
+More plots
+
+```{r}
+sum_scen <- est_df |>
+  filter(term == "year_ct") |> 
+  mutate(mean_abs_dev = abs(estimate - true_slope))
+
+sum_scen_sum <- sum_scen |> 
+  summarise(median = median(mean_abs_dev),
+            upr = quantile(mean_abs_dev, 0.1),
+            lwr = quantile(mean_abs_dev, 0.9),
+            .by = c(retention_rate, model))
+
+ddw <- 0.3  # dodge width
+
+pal <- viridis(length(retention_rates) + 1,
+               option = "mako", begin = 0.3,
+               end = 0.8)[1:length(retention_rates)]
+
+ggplot(sum_scen,
+       aes(retention_rate, mean_abs_dev, 
+           fill = factor(retention_rate),
+           color = factor(retention_rate))) +
+  facet_wrap(~model) +
+  geom_pointrange(
+    data = sum_scen_sum,
+    aes(retention_rate, y = median, ymin = lwr, ymax = upr),
+    color = "grey30", size = 0.2, alpha = 0.4
+  ) +
+  geom_smooth(data = sum_scen_sum,
+    aes(retention_rate, y = median),
+    inherit.aes = FALSE,
+    se = FALSE,
+    linewidth = 0.75,
+    method = "gam", formula = y~s(x, k=3),
+    color = "tomato") +
+  scale_fill_manual(values = pal) +
+  scale_color_manual(values = pal) +
+  guides(color = "none", fill = "none") +
+  labs(
+    x = "Fraction of stomachs retained by year",
+    y = "Mean absolute difference in estimate"
+  )
+
+ggsave(paste0(home, "/figures/year_mad.png"),
+       width = 20, height = 8.5, units = "cm")
+
+ggplot(sum_scen_sum,
+       aes(retention_rate, median)) +
+  facet_wrap(~model) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(
+    se = FALSE,
+    linewidth = 0.75,
+    method = "gam", formula = y~s(x, k=3),
+    color = "tomato") +
+  scale_fill_manual(values = pal) +
+  scale_color_manual(values = pal) +
+  guides(color = "none", fill = "none") +
+  labs(
+    x = "Fraction of stomachs retained by year",
+    y = "Mean absolute difference in estimate"
+  )
+
+ggsave(paste0(home, "/figures/year_mad_noci.png"),
+       width = 20, height = 8.5, units = "cm")
+```
+
+Plot how well we can retrieve the correct sign of the slope when we subsample the dataset
+
+```{r}
+# What is the proportion of not estimating negative slope?
+sum_scen_heat <- est_df |>
+  filter(term == "year_ct") |> 
+  mutate(correct_sign = estimate < 0) |> 
+  summarise(
+    prop_negative = mean(correct_sign),
+    .by = c(retention_rate, true_slope, model)
+  ) |> 
+  mutate(percent_change = (exp(true_slope) - 1) * 100)
+  
+ggplot(sum_scen_heat,
+       aes(retention_rate, true_slope,
+           fill = prop_negative)) + 
+  geom_raster() +
+  facet_wrap(~model) +
+  scale_fill_gradient2(midpoint = 0.9) +
+  labs(
+    x = "Scenario (fraction sampled)",
+    y = "True year slope",
+    fill = "Proportion\nnegative"
+  ) +
+  theme(aspect.ratio = 1,
+        legend.key.height = unit(0.2, "cm"),
+        legend.key.width = unit(0.75, "cm"),
+        legend.position = "bottom") +
+  coord_cartesian(expand = 0)
+
+ggsave(paste0(home, "/figures/power_heat_raw.png"),
+       width = 20, height = 8.5, units = "cm")
+```
+
+Now smooth... and include the 5 year plot
+
+```{r}
+sum_scen_heat <- bind_rows(
+  est_df |> mutate(n_year = 10),
+  est_df_5 |> mutate(n_year = 5)
+) |> 
+  filter(term == "year_ct") |> 
+  mutate(correct_sign = estimate < 0) |> 
+  summarise(
+    prop_negative = mean(correct_sign),
+    .by = c(retention_rate, true_slope, model, n_year)
+  ) |> 
+  mutate(percent_change = (exp(true_slope) - 1) * 100,
+         model_f = as.factor(model))
+
+# Prepare data to fit a manual "one-inflated beta" with sdmTMB
+sum_scen_heat$y_one <- ifelse(
+  sum_scen_heat$prop_negative == 1, 1,
+  ifelse(sum_scen_heat$prop_negative < 1 & sum_scen_heat$prop_negative != 0,
+         0, NA))
+
+sum_scen_heat$y_proportion <- ifelse(sum_scen_heat$prop_negative < 1 & sum_scen_heat$prop_negative > 0, sum_scen_heat$prop_negative, NA)
+
+# 10y
+mheat1 <- sdmTMB(y_one ~ s(true_slope, retention_rate, by = model_f),
+                 spatial = "off",
+                 data = sum_scen_heat |> 
+                   filter(!is.na(y_one) & n_year == 10),
+                 family = binomial(link = "logit"))
+
+mheat2 <- sdmTMB(y_proportion ~ s(true_slope, retention_rate, by = model_f),
+                 spatial = "off",
+                   data = sum_scen_heat |> 
+                     filter(!is.na(y_proportion) & n_year == 10),
+                 family = Beta(link = "logit"))
+
+# 5y
+mheat1_5 <- sdmTMB(y_one ~ s(true_slope, retention_rate, by = model_f),
+                   spatial = "off",
+                   data = sum_scen_heat |> 
+                   filter(!is.na(y_one) & n_year == 5),
+                   family = binomial(link = "logit"))
+
+mheat2_5 <- sdmTMB(y_proportion ~ s(true_slope, retention_rate, by = model_f),
+                   spatial = "off",
+                   data = sum_scen_heat |> 
+                     filter(!is.na(y_proportion) & n_year == 5),
+                   family = Beta(link = "logit"))
+
+# Predict
+nd <- expand_grid(true_slope = seq(min(sum_scen_heat$true_slope),
+                                   max(sum_scen_heat$true_slope),
+                                   length.out = 100),
+                  retention_rate = seq(min(sum_scen_heat$retention_rate),
+                                       max(sum_scen_heat$retention_rate),
+                                       length.out = 100),
+                  model_f = unique(sum_scen_heat$model_f))
+
+# 10y 
+p1 <- plogis(predict(mheat1, newdata = nd, nsim = 500))
+pp <- plogis(predict(mheat2, newdata = nd, nsim = 500))
+
+# 5y
+p1_5 <- plogis(predict(mheat1_5, newdata = nd, nsim = 500))
+pp_5 <- plogis(predict(mheat2_5, newdata = nd, nsim = 500))
+
+# Combine the simulation draws (https://www.sciencedirect.com/science/article/pii/S0167947311003628?via%3Dihub)
+combined <- p1 + (1 - p1) * pp
+combined_5 <- p1_5 + (1 - p1_5) * pp_5
+
+# Summarize
+nd_5 <- nd
+
+nd$est2 <- apply(combined, 1, median)
+nd$lwr  <- apply(combined, 1, quantile, probs = 0.025)
+nd$upr  <- apply(combined, 1, quantile, probs = 0.975)
+
+nd_5$est2 <- apply(combined_5, 1, median)
+nd_5$lwr  <- apply(combined_5, 1, quantile, probs = 0.025)
+nd_5$upr  <- apply(combined_5, 1, quantile, probs = 0.975)
+
+preds <- bind_rows(
+  nd_5 |> mutate(n_years = "5 years"),
+  nd |> mutate(n_years = "10 years")
+)
+
+ggplot(preds, aes(retention_rate, true_slope, fill = est2)) + 
+  geom_raster() +
+  facet_grid(n_years~model_f) +
+  scale_fill_viridis(option = "mako") +
+  # geom_textcontour(aes(retention_rate, true_slope, z = est2, group = model_f,
+  #                      label = after_stat(sprintf("%.2f", level))),
+  #                  inherit.aes = FALSE, breaks = seq(0.7, 0.95, by = 0.1),
+  #                  hjust = 0.95, size = 3, color = "grey30", linewidth = 0.25) +
+  geom_textcontour(aes(retention_rate, true_slope, z = est2, group = model_f,
+                       label = after_stat(sprintf("%.2f", level))),
+                   inherit.aes = FALSE, breaks = 0.8, hjust = 0.95, size = 3, color = "grey30", linewidth = 0.25) +
+  geom_contour(aes(retention_rate, true_slope, z = upr, group = model_f), linetype = 2, alpha = 0.6,
+                   inherit.aes = FALSE, breaks = 0.8, size = 3, color = "grey30", linewidth = 0.25) +
+  geom_contour(aes(retention_rate, true_slope, z = lwr, group = model_f), linetype = 2, alpha = 0.6,
+                   inherit.aes = FALSE, breaks = 0.8, size = 3, color = "grey30", linewidth = 0.25) +
+  
+  geom_textcontour(aes(retention_rate, true_slope, z = est2, group = model_f,
+                       label = after_stat(sprintf("%.2f", level))),
+                   inherit.aes = FALSE, breaks = 0.95, hjust = 0.95, size = 3, color = "grey30", linewidth = 0.25) +
+  geom_contour(aes(retention_rate, true_slope, z = upr, group = model_f), linetype = 2, alpha = 0.6,
+                   inherit.aes = FALSE, breaks = 0.95, size = 3, color = "grey30", linewidth = 0.25) +
+  geom_contour(aes(retention_rate, true_slope, z = lwr, group = model_f), linetype = 2, alpha = 0.6, 
+                   inherit.aes = FALSE, breaks = 0.95, size = 3, color = "grey30", linewidth = 0.25) +
+  
+  labs(
+    x = "Scenario (fraction sampled)",
+    y = "True year slope",
+    fill = "Proportion negative"
+  ) +
+  theme(aspect.ratio = 1,
+        legend.key.height = unit(0.2, "cm"),
+        legend.key.width = unit(0.75, "cm"),
+        legend.position = "bottom") +
+  coord_cartesian(expand = 0)
+
+ggsave(paste0(home, "/figures/power_heat.png"),
+       width = 20, height = 16, units = "cm")
+```
+
+Plot the slopes and data as simulated
+
+```{r}
+pal <- viridis(length(year_slopes) + 1, option = "mako", begin = 0.3, end = 0.8)[1:length(year_slopes)]
+
+# Visualize these effects:
+df <- expand.grid(
+  year = min(d$year):max(d$year),
+  slope = year_slopes
+) |>
+  mutate(
+    # FIXME choose another year
+    year_ct = year - 2014,
+    log_mu = -5.29 + slope * year_ct,
+    mu = exp(log_mu)
+  )
+
+ggplot(df, aes(year, mu*100, fill = factor(slope))) +
+  geom_line(aes(color = factor(slope))) +
+  scale_color_manual(values = pal) +
+  guides(color = "none") +
+  theme(legend.position = "bottom") +
+  labs(
+    x = "Year",
+    y = "Expected Value (%)",
+    fill = "Year Slope",
+    color = "Year Slope"
+  )
+
+ggsave(paste0(home, "/figures/sim_slopes.png"),
+       width = 15, height = 11, units = "cm")
+```
+
+Simulate a single data for each prey set to make plots
+
+```{r}
+vis_sim_dat <- list()
+
+models_list <- list(
+  Herring = m_her,
+  Sprat = m_spr,
+  Other = m_oth
+)
+
+for(model_name in names(models_list)) {
+  
+  m <- models_list[[model_name]]
+   
+  # Get parameters
+  coefs <- tidy(m, effects = "fixed")
+  ran_pars <- tidy(m, effects = "ran_pars")
+  B <- coefs$estimate
+  names(B) <- coefs$term
+  B["year_ct"] <- median(sim_plan$true_slope) #slope_val
+  range <- ran_pars$estimate[ran_pars$term == "range"]
+  sigma_O <- ran_pars$estimate[ran_pars$term == "sigma_O"]
+  phi <- ran_pars$estimate[ran_pars$term == "phi"]
+  tweedie_p <- ran_pars$estimate[ran_pars$term == "tweedie_p"]
+  
+  # Simulate new data given locations in sim dat and parameters
+  sim_data <- sdmTMB_simulate(
+    formula = ~ pred_length_sc + year_ct + depth_sc,
+    data = sim_dat,
+    mesh = mesh,
+    family = tweedie(link = "log"),
+    time = "year",
+    B = B,
+    range = range,
+    sigma_O = sigma_O,
+    phi = phi,
+    tweedie_p = tweedie_p,
+    seed = 99
+  )
+  
+  vis_sim_dat[[model_name]] <- sim_data |> 
+    mutate(prey_group = model_name)
+  
+}
+
+vis_sim_df <- bind_rows(vis_sim_dat)
+
+vis_sim_df |>
+  mutate(empty = ifelse(observed == 0, "Empty", "With food")) |> 
+  ggplot(aes(year, observed, color = empty)) +
+  geom_jitter(height = 0, width = 0.2, alpha = 0.4, size = 0.5) +
+  facet_wrap(~prey_group, ncol = 3) +
+  scale_y_continuous(trans = "sqrt") +
+  scale_color_brewer(palette = "Set2", direction = -1) +
+  labs(x = "Year", y = "Relative prey weight") +
+  theme(legend.title = element_blank(),
+        legend.position = "bottom")
+
+ggsave(paste0(home, "/figures/sim_dat.png"),
+       width = 20, height = 9, units = "cm")
+
+# In space
+vis_sim_df |>
+  mutate(fullness = ifelse(observed == 0, "Empty", "With food")) |> 
+  summarise(n = n(), .by = c(fullness, prey_group)) |> 
+  pivot_wider(names_from = "fullness", values_from = "n") |> 
+  mutate(prop = `With food` / (`With food` + Empty))
+
+vis_sim_df |> 
+  mutate(pred_length = (pred_length_sc*sd(d$pred_length)) + mean(d$pred_length)) |> 
+  ggplot(aes(pred_length)) +
+  labs(x = "Predator length (cm))", y = "Count") +
+  coord_cartesian(expand = 0) +
+  geom_histogram()
+
+vis_sim_df |>
+  filter(year == min(year)) |> 
+  mutate(fullness = ifelse(observed == 0, "Empty", "With food")) |> 
+  ggplot(aes(X, Y, color = fullness, alpha = fullness)) +
+  facet_wrap(~prey_group) +
+  coord_sf() +
+  geom_jitter(height = 5, width = 5, size = 0.5) +
+  scale_color_brewer(palette = "Set2") +
+  scale_x_continuous(expand = expansion(mult = 0.075)) +
+  scale_alpha_manual(values = c(0.5, 1)) +
+  labs(x = "X", y = "Y") +
+  theme(legend.title = element_blank(),
+        legend.position = "bottom")
+
+ggsave(paste0(home, "/figures/sim_dat_space.png"),
+       width = 20, height = 12, units = "cm")
+```
+
+```{r}
+knitr::knit_exit()
+```
